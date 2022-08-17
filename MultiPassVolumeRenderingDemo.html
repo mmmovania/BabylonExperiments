@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+
+        <title>Babylon.js sample code</title>
+
+        <!-- Babylon.js -->
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.6.2/dat.gui.min.js"></script>
+        <script src="https://assets.babylonjs.com/generated/Assets.js"></script>
+        <script src="https://preview.babylonjs.com/ammo.js"></script>
+        <script src="https://preview.babylonjs.com/cannon.js"></script>
+        <script src="https://preview.babylonjs.com/Oimo.js"></script>
+        <script src="https://preview.babylonjs.com/earcut.min.js"></script>
+        <script src="https://preview.babylonjs.com/babylon.js"></script>
+        <script src="https://preview.babylonjs.com/materialsLibrary/babylonjs.materials.min.js"></script>
+        <script src="https://preview.babylonjs.com/proceduralTexturesLibrary/babylonjs.proceduralTextures.min.js"></script>
+        <script src="https://preview.babylonjs.com/postProcessesLibrary/babylonjs.postProcess.min.js"></script>
+        <script src="https://preview.babylonjs.com/loaders/babylonjs.loaders.js"></script>
+        <script src="https://preview.babylonjs.com/serializers/babylonjs.serializers.min.js"></script>
+        <script src="https://preview.babylonjs.com/gui/babylon.gui.min.js"></script>
+        <script src="https://preview.babylonjs.com/inspector/babylon.inspector.bundle.js"></script>
+
+        <style>
+            html, body {
+                overflow: hidden;
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                padding: 0;
+            }
+
+            #renderCanvas {
+                width: 100%;
+                height: 100%;
+                touch-action: none;
+            }
+        </style>
+    </head>
+<body>
+    <canvas id="renderCanvas"></canvas>
+    <script>
+        var canvas = document.getElementById("renderCanvas");
+
+        var startRenderLoop = function (engine, canvas) {
+            engine.runRenderLoop(function () {
+                if (sceneToRender && sceneToRender.activeCamera) {
+                    sceneToRender.render();
+                }
+            });
+        }
+
+        var engine = null;
+        var scene = null;
+        var sceneToRender = null;
+        var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
+        var SHADER_VERTEX_FIRST = `
+    varying vec3 worldSpaceCoords;
+    attribute vec3 position;
+
+    uniform mat4 view;
+    uniform mat4 projection;
+
+    void main()
+    {
+        //Set the world space coordinates of the back faces vertices as output.
+        worldSpaceCoords = position + vec3(0.5, 0.5, 0.5);
+        gl_Position = projection * view * vec4( position, 1.0 );
+    }
+`;
+
+var SHADER_FRAGMENT_FIRST = `
+    varying vec3 worldSpaceCoords;
+
+    void main()
+    {
+        //The fragment's world space coordinates as fragment output.
+        gl_FragColor = vec4( worldSpaceCoords.x , worldSpaceCoords.y, worldSpaceCoords.z, 1 );
+    }
+`; 
+
+var SHADER_VERTEX_SECOND = `
+    varying vec3 worldSpaceCoords;
+    varying vec4 projectedCoords;
+
+    uniform mat4 projection, view, world;
+
+    attribute vec3 position;
+
+    void main()
+    {
+        worldSpaceCoords = (world * vec4(position + vec3(0.5, 0.5,0.5), 1.0 )).xyz;
+        gl_Position = projection *  view * vec4( position, 1.0 );
+        projectedCoords =  gl_Position;
+    }
+`;
+
+var SHADER_FRAGMENT_SECOND = `
+    varying vec3 worldSpaceCoords;
+    varying vec4 projectedCoords;
+    uniform sampler2D tex;
+    uniform sampler2D transferTex;
+    uniform sampler2D cubeTex;
+    uniform float steps;
+    uniform float alphaCorrection;
+    // The maximum distance through our rendering volume is sqrt(3).
+    // The maximum number of steps we take to travel a distance of 1 is 512.
+    // ceil( sqrt(3) * 512 ) = 887
+    // This prevents the back of the image from getting cut off when steps=512 & viewing diagonally.
+    const int MAX_STEPS = 887;
+
+    //Acts like a texture3D using Z slices and trilinear filtering.
+    vec4 sampleAs3DTexture( vec3 texCoord )
+    {
+        vec4 colorSlice1, colorSlice2;
+        vec2 texCoordSlice1, texCoordSlice2;
+
+        //The z coordinate determines which Z slice we have to look for.
+        //Z slice number goes from 0 to 255.
+        float zSliceNumber1 = floor(texCoord.z  * 255.0);
+
+        //As we use trilinear we go the next Z slice.
+        float zSliceNumber2 = min( zSliceNumber1 + 1.0, 255.0); //Clamp to 255
+
+        //The Z slices are stored in a matrix of 16x16 of Z slices.
+        //The original UV coordinates have to be rescaled by the tile numbers in each row and column.
+        texCoord.xy /= 16.0;
+
+        texCoordSlice1 = texCoordSlice2 = texCoord.xy;
+
+        //Add an offset to the original UV coordinates depending on the row and column number.
+        texCoordSlice1.x += (mod(zSliceNumber1, 16.0 ) / 16.0);
+        texCoordSlice1.y += floor((255.0 - zSliceNumber1) / 16.0) / 16.0;
+
+        texCoordSlice2.x += (mod(zSliceNumber2, 16.0 ) / 16.0);
+        texCoordSlice2.y += floor((255.0 - zSliceNumber2) / 16.0) / 16.0;
+
+        //Get the opacity value from the 2D texture.
+        //Bilinear filtering is done at each texture2D by default.
+        colorSlice1 = texture2D( cubeTex, texCoordSlice1 );
+        colorSlice2 = texture2D( cubeTex, texCoordSlice2 );
+
+        //Based on the opacity obtained earlier, get the RGB color in the transfer function texture.
+        colorSlice1.rgb = texture2D( transferTex, vec2( colorSlice1.a, 1.0) ).rgb;
+        colorSlice2.rgb = texture2D( transferTex, vec2( colorSlice2.a, 1.0) ).rgb;
+
+        //How distant is zSlice1 to ZSlice2. Used to interpolate between one Z slice and the other.
+        float zDifference = mod(texCoord.z * 255.0, 1.0);
+
+        //Finally interpolate between the two intermediate colors of each Z slice.
+        return mix(colorSlice1, colorSlice2, zDifference) ;
+    }
+
+
+    void main( void ) {
+
+        //Transform the coordinates it
+        vec2 texc = vec2(((projectedCoords.x / projectedCoords.w) + 1.0 ) / 2.0,
+                        ((projectedCoords.y / projectedCoords.w) + 1.0 ) / 2.0 );
+       // gl_FragColor = texture2D( transferTex, texc);
+       // return;
+
+        //The back position is the world space position stored in the texture.
+        vec3 backPos = texture2D(tex, texc).xyz;
+
+        //The front position is the world space position of the second render pass.
+        vec3 frontPos = worldSpaceCoords;
+
+        //Using NearestFilter for rtTexture mostly eliminates bad backPos values at the edges
+        //of the cube, but there may still be no valid backPos value for the current fragment.
+        if ((backPos.x == 0.0) && (backPos.y == 0.0))
+        {
+            gl_FragColor = vec4(0.0);
+            return;
+        }
+
+        //The direction from the front position to back position.
+        vec3 dir = backPos - frontPos;
+
+        float rayLength = length(dir);
+
+        //Calculate how long to increment in each step.
+        float delta = 1.0 / steps;
+
+        //The increment in each direction for each step.
+        vec3 deltaDirection = normalize(dir) * delta;
+        float deltaDirectionLength = length(deltaDirection);
+
+        //Start the ray casting from the front position.
+        vec3 currentPosition = frontPos;
+
+        //The color accumulator.
+        vec4 accumulatedColor = vec4(0.0);
+
+        //The alpha value accumulated so far.
+        float accumulatedAlpha = 0.0;
+
+        //How long has the ray travelled so far.
+        float accumulatedLength = 0.0;
+
+        //If we have twice as many samples, we only need ~1/2 the alpha per sample.
+        //Scaling by 256/10 just happens to give a good value for the alphaCorrection slider.
+        float alphaScaleFactor = 25.6 * delta;
+
+        vec4 colorSample;
+        float alphaSample;
+
+        //Perform the ray marching iterations
+        for(int i = 0; i < MAX_STEPS; i++)
+        {
+            //Get the voxel intensity value from the 3D texture.
+            colorSample = sampleAs3DTexture( currentPosition );
+
+            //Allow the alpha correction customization.
+            alphaSample = colorSample.a * alphaCorrection;
+
+            //Applying this effect to both the color and alpha accumulation results in more realistic transparency.
+            alphaSample *= (1.0 - accumulatedAlpha);
+
+            //Scaling alpha by the number of steps makes the final color invariant to the step size.
+            alphaSample *= alphaScaleFactor;
+
+            //Perform the composition.
+            accumulatedColor += colorSample * alphaSample;
+
+            //Store the alpha accumulated so far.
+            accumulatedAlpha += alphaSample;
+
+            //Advance the ray.
+            currentPosition += deltaDirection;
+            accumulatedLength += deltaDirectionLength;
+
+            //If the length traversed is more than the ray length, or if the alpha accumulated reaches 1.0 then exit.
+            if(accumulatedLength >= rayLength || accumulatedAlpha >= 1.0 )
+                break;
+        }
+
+        gl_FragColor  = accumulatedColor;
+
+    }
+`;
+
+var  guiControls = new function() {
+    this.model = 'bonsai';
+	this.steps = 256.0;
+	this.alphaCorrection = 2.0;
+	this.color1 = "#00FA58";
+	this.stepPos1 = 0.1;
+	this.color2 = "#CC6600";
+	this.stepPos2 = 0.7;
+	this.color3 = "#F2F200";
+	this.stepPos3 = 1.0;
+};
+
+var pass2Shader;
+var canvas;
+
+var createScene = function () 
+{
+    // This creates a basic Babylon Scene object (non-mesh)
+    var scene = new BABYLON.Scene(engine);
+
+    // This creates and positions a free camera (non-mesh)
+    const camera = new BABYLON.ArcRotateCamera("Camera", -Math.PI, Math.PI, 1, new BABYLON.Vector3(2, 1, 3), scene);
+
+    // This targets the camera to scene origin
+    camera.setTarget(BABYLON.Vector3.Zero());
+
+    // This attaches the camera to the canvas
+    camera.attachControl(canvas, true); 
+
+    // This creates a light, aiming 0,1,0 - to the sky (non-mesh)
+    var light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
+
+    // Default intensity is 1. Let's dim the light a small amount
+    light.intensity = 0.7;
+
+    const boxBackFacing = BABYLON.MeshBuilder.CreateBox("box", {size: 1, sideOrientation: BABYLON.Mesh.BACKSIDE}, scene);	
+    const boxFrontFacing = BABYLON.MeshBuilder.CreateBox("box", {size: 1, sideOrientation: BABYLON.Mesh.FRONTSIDE}, scene);	
+
+    //render box back faces in a rendertarget
+    boxBackFacing.material = new BABYLON.ShaderMaterial("pass1Shader", scene, 
+		{
+            vertexSource: SHADER_VERTEX_FIRST,
+            fragmentSource: SHADER_FRAGMENT_FIRST, 
+		},
+		{
+			attributes: ["position"],
+			uniforms: [ "view", "projection"],
+		},        
+	);
+    
+    //this will allow the box to only render to the rendertarget
+    boxBackFacing.layerMask = 0x10000000; 
+     
+    var renderTarget = new BABYLON.RenderTargetTexture(
+        'render to texture', // name 
+        512, // texture size
+        scene // the scene
+    );
+    scene.customRenderTargets.push(renderTarget); 
+    renderTarget.renderList.push(boxBackFacing);
+
+    //for debugging
+    //create a layer and then assign the first pass render target to 
+    //the texture property
+	//var layer = new BABYLON.Layer('','', scene, true);
+	//layer.texture = renderTarget;
+  
+    pass2Shader = new BABYLON.ShaderMaterial("pass2Shader", scene, {
+            vertexSource: SHADER_VERTEX_SECOND,
+            fragmentSource: SHADER_FRAGMENT_SECOND,
+    },
+    {
+        needAlphaBlending: true, 
+        needAlphaTesting: true,
+        attributes: ["position"],
+        uniforms: ["world", "view", "projection", "steps", "alphaCorrection"],
+        samplers: [ "tex", "cubeTex", "transferTex"],
+	});
+ 
+
+    var old = document.getElementById("tf_container");
+	if (old != null){
+		old.remove();
+	}
+
+    var oldImg = document.getElementById("transferFunctionImg");
+	if (oldImg != null){
+		oldImg.remove();
+	}
+
+    const div = document.createElement('div');    
+    div.id = "tf_container";
+    //div.style.backgroundColor = "#ff0000";
+    //div.style.transition = "0.5s";
+    div.style.position = 'absolute';
+    div.style.width = "100px";
+    div.style.height = "30px";
+    div.style.right = "25%"
+    div.style.top = "56px";
+
+    const img = document.createElement('img');
+    img.id = "transferFunctionImg";
+    img.style.align = 'right';
+    img.style.position = 'absolute';
+    img.style.width = "256px";
+    img.style.height = "30px";
+    div.appendChild(img);
+  
+    document.body.appendChild(div);
+
+    //remove old canvas
+	var oldc = document.getElementById("tf_canvas");
+	if (oldc != null){
+		oldc.remove();
+	}
+
+	canvas = document.createElement('canvas');
+    canvas.id = "tf_canvas";
+	canvas.height = 20;
+	canvas.width = 256;
+
+
+    var cubeTextures = ['bonsai', 'foot', 'teapot'];
+    var transferTexture = updateTransferFunction();
+
+	pass2Shader.setFloat('steps', 256.0);
+	pass2Shader.setFloat('alphaCorrection', 2);	
+	pass2Shader.setTexture("tex", renderTarget);
+	pass2Shader.setTexture("transferTex", transferTexture);
+
+    boxFrontFacing.material = pass2Shader;    
+    
+    //datasets loading    
+    //Load the 2D texture containing the Z slices.
+	cubeTextures['bonsai'] = new BABYLON.Texture("./textures/bonsai.raw.png", scene, null, true, null,  function()
+    {
+        //Don't let it generate mipmaps to save memory and apply linear filtering to prevent use of LOD.
+        cubeTextures['bonsai'].generateMipmaps = false;
+        cubeTextures['bonsai'].minFilter= BABYLON.Texture.LINEAR_LINEAR;
+        cubeTextures['bonsai'].magFilter = BABYLON.Texture.LINEAR_LINEAR;
+         
+        pass2Shader.setTexture("cubeTex", cubeTextures['bonsai']);
+    });
+
+	cubeTextures['teapot'] =  new BABYLON.Texture("./textures/teapot.raw.png", scene, null, true, null, function() {
+        cubeTextures['teapot'].generateMipmaps = false;
+    	cubeTextures['teapot'].minFilter = BABYLON.Texture.LINEAR_LINEAR;
+	    cubeTextures['teapot'].magFilter = BABYLON.Texture.LINEAR_LINEAR;
+    });
+
+	cubeTextures['foot'] =  new BABYLON.Texture("./textures/foot.raw.png", scene, null, true, null, function() {
+        cubeTextures['foot'].generateMipmaps = false;
+	    cubeTextures['foot'].minFilter = BABYLON.Texture.LINEAR_LINEAR;
+	    cubeTextures['foot'].magFilter = BABYLON.Texture.LINEAR_LINEAR;
+    });
+ 
+	
+    //create GUI
+	var oldgui = document.getElementById("datGUI");
+	if (oldgui != null){
+		oldgui.remove();
+	}
+				
+	var gui = new dat.GUI();	
+	
+	gui.domElement.style.marginTop = "55px";
+    gui.domElement.style.marginRight = "0px";
+	gui.domElement.id = "datGUI";
+    var modelSelected = gui.add(guiControls, 'model', [ 'bonsai', 'foot', 'teapot' ] );
+	
+	gui.add(guiControls, 'steps', 0.0, 512.0).onChange(function(value) {
+        pass2Shader.setFloat('steps', value);                
+    });
+	gui.add(guiControls, 'alphaCorrection', 0.01, 5.0).step(0.01).onChange(function(value){
+        pass2Shader.setFloat('alphaCorrection', value);                
+    });
+
+	modelSelected.onChange(function(value) {  
+        pass2Shader.setTexture("cubeTex", cubeTextures[value]);
+    } );
+
+	//Setup transfer function steps.
+	var step1Folder = gui.addFolder('Step 1');
+	var controllerColor1 = step1Folder.addColor(guiControls, 'color1');
+	var controllerStepPos1 = step1Folder.add(guiControls, 'stepPos1', 0.0, 1.0);
+	controllerColor1.onChange(updateTextures);
+	controllerStepPos1.onChange(updateTextures);
+
+	var step2Folder = gui.addFolder('Step 2');
+	var controllerColor2 = step2Folder.addColor(guiControls, 'color2');
+	var controllerStepPos2 = step2Folder.add(guiControls, 'stepPos2', 0.0, 1.0);
+	controllerColor2.onChange(updateTextures);
+	controllerStepPos2.onChange(updateTextures);
+
+	var step3Folder = gui.addFolder('Step 3');
+	var controllerColor3 = step3Folder.addColor(guiControls, 'color3');
+	var controllerStepPos3 = step3Folder.add(guiControls, 'stepPos3', 0.0, 1.0);
+	controllerColor3.onChange(updateTextures);
+	controllerStepPos3.onChange(updateTextures);
+
+	step1Folder.open();
+	step2Folder.open();
+	step3Folder.open();
+
+    return scene;
+}
+
+function updateTransferFunction()
+{ 
+
+	var ctx = canvas.getContext('2d');
+
+    const width = 256;
+    const height = 20;
+    
+	var grd = ctx.createLinearGradient(0, 0, width -1 , height - 1);
+	grd.addColorStop(guiControls.stepPos1, guiControls.color1);
+	grd.addColorStop(guiControls.stepPos2, guiControls.color2);
+	grd.addColorStop(guiControls.stepPos3, guiControls.color3);         
+
+	ctx.fillStyle = grd;
+	ctx.fillRect(0,0,width -1 , height -1 );
+ 
+	var img = document.getElementById("transferFunctionImg");
+	img.src = canvas.toDataURL();
+	img.style.width = "256 px";
+	img.style.height = "128 px";
+ 
+
+    transferTexture = new BABYLON.DynamicTexture("dynamicTexture", { width, height });
+    transferTexture.wrapU = BABYLON.CLAMP_ADDRESSMODE;
+    transferTexture.wrapV = BABYLON.CLAMP_ADDRESSMODE;
+    const ctx2 = transferTexture.getContext();
+  
+	ctx2.fillStyle = grd;
+	ctx2.fillRect(0,0,width -1 , height -1 );
+
+    transferTexture.update(); 
+	return transferTexture; 
+}
+
+
+
+function updateTextures()
+{  
+    pass2Shader.setTexture('transferTex', updateTransferFunction());
+}
+
+                window.initFunction = async function() {
+                    
+                    
+                    var asyncEngineCreation = async function() {
+                        try {
+                        return createDefaultEngine();
+                        } catch(e) {
+                        console.log("the available createEngine function failed. Creating the default engine instead");
+                        return createDefaultEngine();
+                        }
+                    }
+
+                    window.engine = await asyncEngineCreation();
+        if (!engine) throw 'engine should not be null.';
+        startRenderLoop(engine, canvas);
+        window.scene = createScene();};
+        initFunction().then(() => {sceneToRender = scene                    
+        });
+
+        // Resize
+        window.addEventListener("resize", function () {
+            engine.resize();
+        });
+    </script>
+</body>
+</html>
